@@ -26,14 +26,8 @@ export const apiCall = async (
 
   /*
    * IMPORTANT:
-   *
    * Agar data FormData hai (for example student photo upload),
-   * Content-Type manually SET NAHI karna.
-   *
-   * Browser khud:
-   * multipart/form-data; boundary=...
-   *
-   * set karega.
+   * Content-Type manually SET NAHI karna. Browser khud boundary set karega.
    */
   if (data instanceof FormData) {
     config.body = data;
@@ -43,9 +37,7 @@ export const apiCall = async (
   }
 
   try {
-    console.log(
-      `${method} ${API_BASE_URL}${endpoint}`
-    );
+    console.log(`${method} ${API_BASE_URL}${endpoint}`);
 
     const response = await fetch(
       `${API_BASE_URL}${endpoint}`,
@@ -63,11 +55,7 @@ export const apiCall = async (
       };
     }
 
-    console.log(
-      "API response:",
-      response.status,
-      result
-    );
+    console.log("API response:", response.status, result);
 
     if (!response.ok) {
       return {
@@ -86,19 +74,14 @@ export const apiCall = async (
       data: result,
     };
   } catch (error) {
-    console.error(
-      "API connection error:",
-      error
-    );
+    console.error("API connection error:", error);
 
     return {
       success: false,
       status: 0,
       message:
-        "",
+        error?.message || "Network error. Please check your connection.",
       error,
     };
   }
 };
-
-export { API_BASE_URL };
