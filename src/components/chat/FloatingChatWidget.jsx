@@ -11,15 +11,12 @@ import {
   Eye,
   Users,
   Paperclip,
-  ExternalLink,
-  Download,
   FileText,
   Trash2,
   ChevronDown,
   Maximize2,
   Minimize2,
   Award,
-  Sparkles,
 } from "lucide-react";
 import { useChat } from "../../context/ChatContext";
 import { apiCall, API_BASE_URL } from "../../services/api";
@@ -50,7 +47,6 @@ const getFileExtension = (filename = "") => {
 
 function FloatingChatWidget({ role = "teacher" }) {
   const {
-    socketConnected,
     currentUserId,
     contacts,
     refreshContacts,
@@ -79,6 +75,7 @@ function FloatingChatWidget({ role = "teacher" }) {
   const [selectedPartner, setSelectedPartner] = useState(null);
   const [selectedMonitorRoom, setSelectedMonitorRoom] = useState(null);
   const [messageText, setMessageText] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
   const [showTaskForm, setShowTaskForm] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskDesc, setTaskDesc] = useState("");
@@ -196,23 +193,33 @@ function FloatingChatWidget({ role = "teacher" }) {
     }, 1500);
   };
 
-  const handleSendText = (e) => {
+  const handleSendText = async (e) => {
     e.preventDefault();
-    if (!messageText.trim() || !selectedPartner) return;
+    const trimmed = messageText.trim();
+    if (!trimmed || !selectedPartner?._id || sendingMessage) return;
 
-    sendMessage({
-      receiver: selectedPartner,
-      text: messageText.trim(),
-      messageType: "text",
-    });
-
-    emitStopTyping(selectedPartner._id);
+    setSendingMessage(true);
     setMessageText("");
+    emitStopTyping(selectedPartner._id);
+
+    try {
+      await sendMessage({
+        receiver: {
+          _id: String(selectedPartner._id),
+          role: selectedPartner.role || "student",
+          name: selectedPartner.name || "User",
+        },
+        text: trimmed,
+        messageType: "text",
+      });
+    } finally {
+      setSendingMessage(false);
+    }
   };
 
   const handleSendTask = async (e) => {
     e.preventDefault();
-    if (!taskTitle.trim() || !selectedPartner || sendingTask) return;
+    if (!taskTitle.trim() || !selectedPartner?._id || sendingTask) return;
 
     setSendingTask(true);
     let attachmentUrl = "";
@@ -229,8 +236,12 @@ function FloatingChatWidget({ role = "teacher" }) {
         }
       }
 
-      sendMessage({
-        receiver: selectedPartner,
+      await sendMessage({
+        receiver: {
+          _id: String(selectedPartner._id),
+          role: selectedPartner.role || "student",
+          name: selectedPartner.name || "User",
+        },
         text: taskTitle.trim(),
         messageType: "task",
         attachmentUrl,
@@ -282,7 +293,7 @@ function FloatingChatWidget({ role = "teacher" }) {
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
-    if (!file || !selectedPartner) return;
+    if (!file || !selectedPartner?._id) return;
 
     const formData = new FormData();
     formData.append("attachment", file);
@@ -291,8 +302,12 @@ function FloatingChatWidget({ role = "teacher" }) {
     try {
       const res = await apiCall("/chat/upload", "POST", formData);
       if (res.success && res.data?.data?.attachmentUrl) {
-        sendMessage({
-          receiver: selectedPartner,
+        await sendMessage({
+          receiver: {
+            _id: String(selectedPartner._id),
+            role: selectedPartner.role || "student",
+            name: selectedPartner.name || "User",
+          },
           text: file.name,
           messageType: "file",
           attachmentUrl: res.data.data.attachmentUrl,
@@ -637,7 +652,7 @@ function FloatingChatWidget({ role = "teacher" }) {
             {currentMessages.length === 0 ? (
               <div className="h-full flex items-center justify-center">
                 <span className="bg-white border border-slate-200/80 text-slate-500 text-xs font-medium px-4 py-2 rounded-full shadow-2xs">
-                  Say Assalam-o-Alaikum to {selectedPartner.name} 
+                  Say Assalam-o-Alaikum to {selectedPartner.name}
                 </span>
               </div>
             ) : (
@@ -920,7 +935,7 @@ function FloatingChatWidget({ role = "teacher" }) {
 
             <button
               type="submit"
-              disabled={!messageText.trim()}
+              disabled={!messageText.trim() || sendingMessage}
               className="w-9 h-9 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#3B82F6] hover:from-[#1D4ED8] hover:to-[#2563EB] disabled:opacity-40 text-white flex items-center justify-center transition shrink-0 shadow-sm"
             >
               <Send className="w-4 h-4" />

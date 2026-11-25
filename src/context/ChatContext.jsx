@@ -26,6 +26,17 @@ const resolveSocketServerUrl = () => {
 
 const SOCKET_SERVER_URL = resolveSocketServerUrl();
 
+const getTokenForSession = (session) => {
+  if (session === "admin") return localStorage.getItem("adminToken");
+  if (session === "teacher") return localStorage.getItem("teacherToken");
+  if (session === "student") return localStorage.getItem("studentToken");
+  return (
+    localStorage.getItem("adminToken") ||
+    localStorage.getItem("teacherToken") ||
+    localStorage.getItem("studentToken")
+  );
+};
+
 const buildRoomId = (id1, id2) => {
   return [String(id1), String(id2)].sort().join("_");
 };
@@ -114,7 +125,6 @@ export function ChatProvider({ session, children }) {
     }
   }, []);
 
-  // Fetch all contacts (Students, Teachers, Admin)
   const refreshContacts = useCallback(async () => {
     if (!session) return;
     const res = await apiCall("/chat/contacts", "GET");
@@ -123,7 +133,6 @@ export function ChatProvider({ session, children }) {
     }
   }, [session]);
 
-  // Admin: fetch all conversations across Teachers & Students
   const refreshAdminConversations = useCallback(async () => {
     if (session !== "admin") return;
     const res = await apiCall("/chat/admin/all-conversations", "GET");
@@ -132,7 +141,6 @@ export function ChatProvider({ session, children }) {
     }
   }, [session]);
 
-  // Load chat history with a partner
   const loadMessagesWithPartner = useCallback(
     async (partnerId) => {
       if (!partnerId) return;
@@ -159,7 +167,6 @@ export function ChatProvider({ session, children }) {
     []
   );
 
-  // Admin: load messages of any Teacher-Student room
   const loadAdminRoomMessages = useCallback(async (roomId) => {
     if (!roomId) return;
     const res = await apiCall(`/chat/admin/room/${roomId}`, "GET");
@@ -171,7 +178,6 @@ export function ChatProvider({ session, children }) {
     }
   }, []);
 
-  // Initialize Socket.io connection when logged in
   useEffect(() => {
     if (!session) {
       if (socketRef.current) {
@@ -190,16 +196,14 @@ export function ChatProvider({ session, children }) {
       refreshAdminConversations();
     }
 
-    const token =
-      localStorage.getItem("studentToken") ||
-      localStorage.getItem("teacherToken") ||
-      localStorage.getItem("adminToken");
-
+    const token = getTokenForSession(session);
     if (!token) return;
 
     const socket = io(SOCKET_SERVER_URL, {
+      path: "/socket.io",
       auth: { token },
-      transports: ["websocket", "polling"],
+      transports: ["polling", "websocket"],
+      withCredentials: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
@@ -212,6 +216,11 @@ export function ChatProvider({ session, children }) {
       refreshContacts();
     });
 
+    socket.on("connect_error", (err) => {
+      console.error("[Chat Socket connect_error]:", err?.message || err);
+      setSocketConnected(false);
+    });
+
     socket.on("disconnect", () => {
       setSocketConnected(false);
     });
@@ -220,7 +229,6 @@ export function ChatProvider({ session, children }) {
       setOnlineUserIds(Array.isArray(ids) ? ids.map(String) : []);
     });
 
-    // Incoming real-time message
     socket.on("receive_message", (msg) => {
       const senderIdStr = String(msg.senderId);
       const isCurrentlyOpen = activePartnerRef.current === senderIdStr;
@@ -305,7 +313,6 @@ export function ChatProvider({ session, children }) {
       }
     });
 
-    // Multi-tab / server confirmation echo
     socket.on("message_sent", (msg) => {
       const receiverIdStr = String(msg.receiverId);
       setMessagesByPartner((prev) => {
@@ -327,7 +334,6 @@ export function ChatProvider({ session, children }) {
       });
     });
 
-    // Real-time Delete for Everyone update
     socket.on("message_deleted_everyone", ({ messageId, senderId, receiverId, roomId }) => {
       const partnerId =
         String(senderId) === currentUserId ? String(receiverId) : String(senderId);
@@ -385,7 +391,6 @@ export function ChatProvider({ session, children }) {
       }
     });
 
-    // Admin global live stream
     socket.on("admin_live_message", (msg) => {
       if (session !== "admin") return;
       setAdminRoomMessages((prev) => {
@@ -399,7 +404,6 @@ export function ChatProvider({ session, children }) {
       refreshAdminConversations();
     });
 
-    // Live typing indicator
     socket.on("user_typing", ({ senderId }) => {
       setTypingUsers((prev) => ({ ...prev, [String(senderId)]: true }));
     });
@@ -412,7 +416,6 @@ export function ChatProvider({ session, children }) {
       });
     });
 
-    // Blue ticks read receipt
     socket.on("messages_seen", ({ byUserId }) => {
       const partnerStr = String(byUserId);
       setMessagesByPartner((prev) => {
@@ -427,7 +430,6 @@ export function ChatProvider({ session, children }) {
       });
     });
 
-    // Task status live update
     socket.on("task_status_updated", (updatedMsg) => {
       const partnerId =
         String(updatedMsg.senderId) === currentUserId
@@ -458,9 +460,8 @@ export function ChatProvider({ session, children }) {
     requestNotificationPermission,
   ]);
 
-  // Optimistic instant send
   const sendMessage = useCallback(
-    ({
+    async ({
       receiver,
       text = "",
       messageType = "text",
@@ -513,37 +514,56 @@ export function ChatProvider({ session, children }) {
         )
       );
 
+      const payload = {
+        receiverId: receiverIdStr,
+        receiverRole: receiver.role || "student",
+        receiverName: receiver.name || "User",
+        text,
+        messageType,
+        task,
+        attachmentUrl,
+        attachmentName,
+        tempId,
+      };
+
       if (socketRef.current?.connected) {
-        socketRef.current.emit(
-          "send_message",
-          {
-            receiverId: receiverIdStr,
-            receiverRole: receiver.role || "student",
-            receiverName: receiver.name || "User",
-            text,
-            messageType,
-            task,
-            attachmentUrl,
-            attachmentName,
-            tempId,
-          },
-          (ack) => {
-            if (ack?.success && ack.message) {
+        socketRef.current.emit("send_message", payload, async (ack) => {
+          if (ack?.success && ack.message) {
+            setMessagesByPartner((prev) => ({
+              ...prev,
+              [receiverIdStr]: (prev[receiverIdStr] || []).map((m) =>
+                m._id === tempId ? ack.message : m
+              ),
+            }));
+          } else {
+            const fallbackRes = await apiCall("/chat/send", "POST", payload);
+            const saved = fallbackRes.data?.data?.message;
+            if (fallbackRes.success && saved) {
               setMessagesByPartner((prev) => ({
                 ...prev,
                 [receiverIdStr]: (prev[receiverIdStr] || []).map((m) =>
-                  m._id === tempId ? ack.message : m
+                  m._id === tempId ? saved : m
                 ),
               }));
             }
           }
-        );
+        });
+      } else {
+        const fallbackRes = await apiCall("/chat/send", "POST", payload);
+        const saved = fallbackRes.data?.data?.message;
+        if (fallbackRes.success && saved) {
+          setMessagesByPartner((prev) => ({
+            ...prev,
+            [receiverIdStr]: (prev[receiverIdStr] || []).map((m) =>
+              m._id === tempId ? saved : m
+            ),
+          }));
+        }
       }
     },
     [currentUser, currentUserId, currentUserRole]
   );
 
-  // Delete single message ("me" | "everyone")
   const deleteMessage = useCallback(async (partnerId, messageId, mode = "me") => {
     const partnerStr = String(partnerId);
     const msgIdStr = String(messageId);
@@ -579,7 +599,6 @@ export function ChatProvider({ session, children }) {
     }
   }, []);
 
-  // Delete / Clear entire chat with a partner
   const clearChatWithPartner = useCallback(async (partnerId) => {
     const partnerStr = String(partnerId);
     setMessagesByPartner((prev) => ({
@@ -596,7 +615,6 @@ export function ChatProvider({ session, children }) {
     await apiCall(`/chat/conversation/${partnerStr}`, "DELETE");
   }, []);
 
-  // Admin: Permanently delete a monitored conversation room
   const deleteAdminMonitorRoom = useCallback(async (roomId) => {
     await apiCall(`/chat/admin/room/${roomId}`, "DELETE");
     setAdminConversations((prev) => prev.filter((c) => c._id !== roomId));
@@ -661,7 +679,6 @@ export function ChatProvider({ session, children }) {
     <ChatContext.Provider value={value}>
       {children}
 
-      {/* Floating Instant Message Notification Banner */}
       {toastAlert && (
         <div className="fixed top-4 right-4 z-[9999] max-w-xs w-full bg-[#075E54] text-white rounded-2xl shadow-2xl p-3.5 border border-emerald-400/30">
           <div className="flex items-start justify-between gap-2">

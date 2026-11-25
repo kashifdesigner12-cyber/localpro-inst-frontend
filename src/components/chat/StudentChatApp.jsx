@@ -69,6 +69,7 @@ function StudentChatApp({ onLogout }) {
   const [roleFilter, setRoleFilter] = useState("all");
   const [selectedPartner, setSelectedPartner] = useState(null);
   const [messageText, setMessageText] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [displayNameInput, setDisplayNameInput] = useState(
     currentUser?.chatDisplayName || currentUser?.name || ""
@@ -183,23 +184,33 @@ function StudentChatApp({ onLogout }) {
     }, 1500);
   };
 
-  const handleSendText = (e) => {
+  const handleSendText = async (e) => {
     e.preventDefault();
-    if (!messageText.trim() || !selectedPartner) return;
+    const trimmed = messageText.trim();
+    if (!trimmed || !selectedPartner?._id || sendingMessage) return;
 
-    sendMessage({
-      receiver: selectedPartner,
-      text: messageText.trim(),
-      messageType: "text",
-    });
-
-    emitStopTyping(selectedPartner._id);
+    setSendingMessage(true);
     setMessageText("");
+    emitStopTyping(selectedPartner._id);
+
+    try {
+      await sendMessage({
+        receiver: {
+          _id: String(selectedPartner._id),
+          role: selectedPartner.role || "teacher",
+          name: selectedPartner.name || "User",
+        },
+        text: trimmed,
+        messageType: "text",
+      });
+    } finally {
+      setSendingMessage(false);
+    }
   };
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
-    if (!file || !selectedPartner) return;
+    if (!file || !selectedPartner?._id) return;
 
     const formData = new FormData();
     formData.append("attachment", file);
@@ -208,8 +219,12 @@ function StudentChatApp({ onLogout }) {
     try {
       const res = await apiCall("/chat/upload", "POST", formData);
       if (res.success && res.data?.data?.attachmentUrl) {
-        sendMessage({
-          receiver: selectedPartner,
+        await sendMessage({
+          receiver: {
+            _id: String(selectedPartner._id),
+            role: selectedPartner.role || "teacher",
+            name: selectedPartner.name || "User",
+          },
           text: file.name,
           messageType: "file",
           attachmentUrl: res.data.data.attachmentUrl,
@@ -997,7 +1012,7 @@ function StudentChatApp({ onLogout }) {
 
                 <button
                   type="submit"
-                  disabled={!messageText.trim()}
+                  disabled={!messageText.trim() || sendingMessage}
                   className="w-10 h-10 sm:w-9 sm:h-9 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#3B82F6] hover:from-[#1D4ED8] hover:to-[#2563EB] disabled:opacity-40 text-white flex items-center justify-center transition shrink-0 shadow-sm"
                 >
                   <Send className="w-4 h-4" />

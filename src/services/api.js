@@ -22,6 +22,27 @@ const resolveApiBaseUrl = () => {
 
 export const API_BASE_URL = resolveApiBaseUrl();
 
+const getActiveToken = () => {
+  if (typeof window === "undefined") return "";
+  const pathname = window.location.pathname || "";
+
+  if (pathname.startsWith("/student")) {
+    return (
+      localStorage.getItem("studentToken") ||
+      localStorage.getItem("teacherToken") ||
+      localStorage.getItem("adminToken") ||
+      ""
+    );
+  }
+
+  return (
+    localStorage.getItem("adminToken") ||
+    localStorage.getItem("teacherToken") ||
+    localStorage.getItem("studentToken") ||
+    ""
+  );
+};
+
 export const apiCall = async (
   endpoint,
   method = "GET",
@@ -33,17 +54,12 @@ export const apiCall = async (
     normalizedEndpoint = normalizedEndpoint.replace(/^\/api/, "");
   }
 
-  // Login token (Student, Teacher, or Admin)
-  const token =
-    localStorage.getItem("studentToken") ||
-    localStorage.getItem("teacherToken") ||
-    localStorage.getItem("adminToken");
+  const token = getActiveToken();
 
   const headers = {
     Accept: "application/json",
   };
 
-  // Token available ho to Authorization header
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
