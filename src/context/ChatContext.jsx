@@ -90,6 +90,7 @@ export function ChatProvider({ session, children }) {
 
   const socketRef = useRef(null);
   const activePartnerRef = useRef(null);
+  const prevUnreadTotalRef = useRef(0);
 
   useEffect(() => {
     activePartnerRef.current = activePartnerId;
@@ -129,7 +130,37 @@ export function ChatProvider({ session, children }) {
     if (!session) return;
     const res = await apiCall("/chat/contacts", "GET");
     if (res.success && Array.isArray(res.data?.data?.contacts)) {
-      setContacts(res.data.data.contacts);
+      const freshContacts = res.data.data.contacts;
+      setContacts(freshContacts);
+
+      // Play sound if unread count increased while polling
+      const newUnread = freshContacts.reduce(
+        (sum, c) => sum + (c.unreadCount || 0),
+        0
+      );
+      if (newUnread > prevUnreadTotalRef.current && prevUnreadTotalRef.current >= 0) {
+        const newestUnread = freshContacts.find(
+          (c) =>
+            (c.unreadCount || 0) > 0 &&
+            String(c._id) !== String(activePartnerRef.current)
+        );
+        if (newestUnread && prevUnreadTotalRef.current !== 0) {
+          playNotificationSound();
+          triggerBrowserNotification(
+            `${newestUnread.name}`,
+            newestUnread.lastMessage || "New message"
+          );
+          setToastAlert({
+            id: Date.now(),
+            senderId: String(newestUnread._id),
+            senderName: newestUnread.name,
+            senderRole: newestUnread.role || "",
+            text: newestUnread.lastMessage || "New message",
+          });
+          setTimeout(() => setToastAlert(null), 4000);
+        }
+      }
+      prevUnreadTotalRef.current = newUnread;
     }
   }, [session]);
 
@@ -142,26 +173,44 @@ export function ChatProvider({ session, children }) {
   }, [session]);
 
   const loadMessagesWithPartner = useCallback(
-    async (partnerId) => {
+    async (partnerId, silent = false) => {
       if (!partnerId) return;
-      setActivePartnerId(String(partnerId));
+      const partnerStr = String(partnerId);
+      if (!silent) {
+        setActivePartnerId(partnerStr);
+      }
 
       setContacts((prev) =>
         prev.map((c) =>
-          String(c._id) === String(partnerId) ? { ...c, unreadCount: 0 } : c
+          String(c._id) === partnerStr ? { ...c, unreadCount: 0 } : c
         )
       );
 
       if (socketRef.current?.connected) {
-        socketRef.current.emit("mark_seen", { senderId: String(partnerId) });
+        socketRef.current.emit("mark_seen", { senderId: partnerStr });
       }
 
-      const res = await apiCall(`/chat/messages/${partnerId}`, "GET");
+      const res = await apiCall(`/chat/messages/${partnerStr}`, "GET");
       if (res.success && Array.isArray(res.data?.data?.messages)) {
-        setMessagesByPartner((prev) => ({
-          ...prev,
-          [String(partnerId)]: res.data.data.messages,
-        }));
+        const serverMsgs = res.data.data.messages;
+        setMessagesByPartner((prev) => {
+          const current = prev[partnerStr] || [];
+          // Keep any unconfirmed optimistic temp messages while merging server messages
+          const pendingTemps = current.filter(
+            (m) =>
+              String(m._id).startsWith("temp_") &&
+              !serverMsgs.some(
+                (sm) =>
+                  sm.text === m.text &&
+                  String(sm.senderId) === String(m.senderId) &&
+                  Math.abs(new Date(sm.createdAt) - new Date(m.createdAt)) < 15000
+              )
+          );
+          return {
+            ...prev,
+            [partnerStr]: [...serverMsgs, ...pendingTemps],
+          };
+        });
       }
     },
     []
@@ -177,6 +226,30 @@ export function ChatProvider({ session, children }) {
       }));
     }
   }, []);
+
+  // REAL-TIME FALLBACK POLLING: Every 2 seconds when WebSocket is blocked by hosting proxy
+  useEffect(() => {
+    if (!session || socketConnected) return;
+
+    const intervalId = setInterval(() => {
+      if (document.hidden) return;
+      refreshContacts();
+      if (activePartnerRef.current) {
+        loadMessagesWithPartner(activePartnerRef.current, true);
+      }
+      if (session === "admin") {
+        refreshAdminConversations();
+      }
+    }, 2000);
+
+    return () => clearInterval(intervalId);
+  }, [
+    session,
+    socketConnected,
+    refreshContacts,
+    loadMessagesWithPartner,
+    refreshAdminConversations,
+  ]);
 
   useEffect(() => {
     if (!session) {
@@ -205,8 +278,8 @@ export function ChatProvider({ session, children }) {
       transports: ["polling", "websocket"],
       withCredentials: true,
       reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 2000,
     });
 
     socketRef.current = socket;
@@ -216,8 +289,7 @@ export function ChatProvider({ session, children }) {
       refreshContacts();
     });
 
-    socket.on("connect_error", (err) => {
-      console.error("[Chat Socket connect_error]:", err?.message || err);
+    socket.on("connect_error", () => {
       setSocketConnected(false);
     });
 
