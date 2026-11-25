@@ -1,0 +1,690 @@
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { io } from "socket.io-client";
+import { apiCall, API_BASE_URL } from "../services/api";
+
+const ChatContext = createContext(null);
+
+const resolveSocketServerUrl = () => {
+  const fromApi = API_BASE_URL.replace(/\/api\/?$/, "");
+  if (fromApi) return fromApi;
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:5000";
+    }
+  }
+  return "https://apinstitute.localpro1.net";
+};
+
+const SOCKET_SERVER_URL = resolveSocketServerUrl();
+
+const buildRoomId = (id1, id2) => {
+  return [String(id1), String(id2)].sort().join("_");
+};
+
+const playNotificationSound = () => {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1180, ctx.currentTime + 0.12);
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.25);
+  } catch {
+    // Ignore autoplay restriction before first tap
+  }
+};
+
+const triggerBrowserNotification = (title, body) => {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  if (Notification.permission === "granted") {
+    try {
+      new Notification(title, {
+        body,
+        icon: "/institute-logo.png",
+        badge: "/institute-logo.png",
+      });
+    } catch {
+      // Fallback for mobile browsers
+    }
+  }
+};
+
+export function ChatProvider({ session, children }) {
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [contacts, setContacts] = useState([]);
+  const [messagesByPartner, setMessagesByPartner] = useState({});
+  const [onlineUserIds, setOnlineUserIds] = useState([]);
+  const [typingUsers, setTypingUsers] = useState({});
+  const [activePartnerId, setActivePartnerId] = useState(null);
+  const [adminConversations, setAdminConversations] = useState([]);
+  const [adminRoomMessages, setAdminRoomMessages] = useState({});
+  const [toastAlert, setToastAlert] = useState(null);
+
+  const socketRef = useRef(null);
+  const activePartnerRef = useRef(null);
+
+  useEffect(() => {
+    activePartnerRef.current = activePartnerId;
+  }, [activePartnerId]);
+
+  const currentUser = useMemo(() => {
+    try {
+      if (session === "admin") {
+        return JSON.parse(localStorage.getItem("adminUser") || "null");
+      }
+      if (session === "teacher") {
+        return JSON.parse(localStorage.getItem("teacherUser") || "null");
+      }
+      if (session === "student") {
+        return JSON.parse(localStorage.getItem("studentUser") || "null");
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }, [session]);
+
+  const currentUserId = String(currentUser?._id || currentUser?.id || "");
+  const currentUserRole = String(session || currentUser?.role || "").toLowerCase();
+
+  const requestNotificationPermission = useCallback(() => {
+    if (
+      typeof window !== "undefined" &&
+      "Notification" in window &&
+      Notification.permission === "default"
+    ) {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
+
+  // Fetch all contacts (Students, Teachers, Admin)
+  const refreshContacts = useCallback(async () => {
+    if (!session) return;
+    const res = await apiCall("/chat/contacts", "GET");
+    if (res.success && Array.isArray(res.data?.data?.contacts)) {
+      setContacts(res.data.data.contacts);
+    }
+  }, [session]);
+
+  // Admin: fetch all conversations across Teachers & Students
+  const refreshAdminConversations = useCallback(async () => {
+    if (session !== "admin") return;
+    const res = await apiCall("/chat/admin/all-conversations", "GET");
+    if (res.success && Array.isArray(res.data?.data?.conversations)) {
+      setAdminConversations(res.data.data.conversations);
+    }
+  }, [session]);
+
+  // Load chat history with a partner
+  const loadMessagesWithPartner = useCallback(
+    async (partnerId) => {
+      if (!partnerId) return;
+      setActivePartnerId(String(partnerId));
+
+      setContacts((prev) =>
+        prev.map((c) =>
+          String(c._id) === String(partnerId) ? { ...c, unreadCount: 0 } : c
+        )
+      );
+
+      if (socketRef.current?.connected) {
+        socketRef.current.emit("mark_seen", { senderId: String(partnerId) });
+      }
+
+      const res = await apiCall(`/chat/messages/${partnerId}`, "GET");
+      if (res.success && Array.isArray(res.data?.data?.messages)) {
+        setMessagesByPartner((prev) => ({
+          ...prev,
+          [String(partnerId)]: res.data.data.messages,
+        }));
+      }
+    },
+    []
+  );
+
+  // Admin: load messages of any Teacher-Student room
+  const loadAdminRoomMessages = useCallback(async (roomId) => {
+    if (!roomId) return;
+    const res = await apiCall(`/chat/admin/room/${roomId}`, "GET");
+    if (res.success && Array.isArray(res.data?.data?.messages)) {
+      setAdminRoomMessages((prev) => ({
+        ...prev,
+        [roomId]: res.data.data.messages,
+      }));
+    }
+  }, []);
+
+  // Initialize Socket.io connection when logged in
+  useEffect(() => {
+    if (!session) {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+        socketRef.current = null;
+      }
+      setSocketConnected(false);
+      setContacts([]);
+      setMessagesByPartner({});
+      return;
+    }
+
+    requestNotificationPermission();
+    refreshContacts();
+    if (session === "admin") {
+      refreshAdminConversations();
+    }
+
+    const token =
+      localStorage.getItem("studentToken") ||
+      localStorage.getItem("teacherToken") ||
+      localStorage.getItem("adminToken");
+
+    if (!token) return;
+
+    const socket = io(SOCKET_SERVER_URL, {
+      auth: { token },
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+    });
+
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      setSocketConnected(true);
+      refreshContacts();
+    });
+
+    socket.on("disconnect", () => {
+      setSocketConnected(false);
+    });
+
+    socket.on("online_users", (ids) => {
+      setOnlineUserIds(Array.isArray(ids) ? ids.map(String) : []);
+    });
+
+    // Incoming real-time message
+    socket.on("receive_message", (msg) => {
+      const senderIdStr = String(msg.senderId);
+      const isCurrentlyOpen = activePartnerRef.current === senderIdStr;
+
+      setMessagesByPartner((prev) => {
+        const existing = prev[senderIdStr] || [];
+        if (existing.some((m) => String(m._id) === String(msg._id))) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [senderIdStr]: [...existing, msg],
+        };
+      });
+
+      const previewText =
+        msg.messageType === "task"
+          ? `📋 Task: ${msg.task?.title || msg.text}`
+          : msg.text || msg.attachmentName || "New message";
+
+      setContacts((prev) => {
+        const exists = prev.some((c) => String(c._id) === senderIdStr);
+        let updated;
+
+        if (exists) {
+          updated = prev.map((c) => {
+            if (String(c._id) === senderIdStr) {
+              return {
+                ...c,
+                lastMessage: previewText,
+                lastMessageTime: msg.createdAt,
+                unreadCount: isCurrentlyOpen ? 0 : (c.unreadCount || 0) + 1,
+              };
+            }
+            return c;
+          });
+        } else {
+          updated = [
+            {
+              _id: senderIdStr,
+              name: msg.senderName || "User",
+              subtitle: String(msg.senderRole || "").toUpperCase(),
+              role: String(msg.senderRole || "teacher").toLowerCase(),
+              photo: "",
+              isOnline: true,
+              unreadCount: isCurrentlyOpen ? 0 : 1,
+              lastMessage: previewText,
+              lastMessageTime: msg.createdAt,
+            },
+            ...prev,
+          ];
+        }
+
+        return [...updated].sort((a, b) => {
+          if (a.lastMessageTime && b.lastMessageTime) {
+            return new Date(b.lastMessageTime) - new Date(a.lastMessageTime);
+          }
+          if (a.lastMessageTime) return -1;
+          if (b.lastMessageTime) return 1;
+          return 0;
+        });
+      });
+
+      if (isCurrentlyOpen) {
+        socket.emit("mark_seen", { senderId: senderIdStr });
+      } else {
+        playNotificationSound();
+        triggerBrowserNotification(
+          `${msg.senderName || "New Message"} (${String(msg.senderRole || "").toUpperCase()})`,
+          previewText
+        );
+        setToastAlert({
+          id: msg._id || Date.now(),
+          senderId: senderIdStr,
+          senderName: msg.senderName || "New Message",
+          senderRole: msg.senderRole || "",
+          text: previewText,
+        });
+        setTimeout(() => {
+          setToastAlert(null);
+        }, 4500);
+      }
+    });
+
+    // Multi-tab / server confirmation echo
+    socket.on("message_sent", (msg) => {
+      const receiverIdStr = String(msg.receiverId);
+      setMessagesByPartner((prev) => {
+        const list = prev[receiverIdStr] || [];
+        const hasTemp = msg.tempId && list.some((m) => m._id === msg.tempId);
+        if (hasTemp) {
+          return {
+            ...prev,
+            [receiverIdStr]: list.map((m) => (m._id === msg.tempId ? msg : m)),
+          };
+        }
+        if (list.some((m) => String(m._id) === String(msg._id))) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [receiverIdStr]: [...list, msg],
+        };
+      });
+    });
+
+    // Real-time Delete for Everyone update
+    socket.on("message_deleted_everyone", ({ messageId, senderId, receiverId, roomId }) => {
+      const partnerId =
+        String(senderId) === currentUserId ? String(receiverId) : String(senderId);
+
+      setMessagesByPartner((prev) => {
+        const list = prev[partnerId];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [partnerId]: list.map((m) =>
+            String(m._id) === String(messageId)
+              ? {
+                  ...m,
+                  isDeletedForEveryone: true,
+                  messageType: "text",
+                  text: "🚫 This message was deleted",
+                  attachmentUrl: "",
+                  attachmentName: "",
+                  task: undefined,
+                }
+              : m
+          ),
+        };
+      });
+
+      setContacts((prev) =>
+        prev.map((c) =>
+          String(c._id) === partnerId
+            ? { ...c, lastMessage: "🚫 This message was deleted" }
+            : c
+        )
+      );
+
+      if (roomId) {
+        setAdminRoomMessages((prev) => {
+          const list = prev[roomId];
+          if (!list) return prev;
+          return {
+            ...prev,
+            [roomId]: list.map((m) =>
+              String(m._id) === String(messageId)
+                ? {
+                    ...m,
+                    isDeletedForEveryone: true,
+                    messageType: "text",
+                    text: "🚫 This message was deleted",
+                    attachmentUrl: "",
+                    attachmentName: "",
+                    task: undefined,
+                  }
+                : m
+            ),
+          };
+        });
+      }
+    });
+
+    // Admin global live stream
+    socket.on("admin_live_message", (msg) => {
+      if (session !== "admin") return;
+      setAdminRoomMessages((prev) => {
+        const list = prev[msg.roomId] || [];
+        if (list.some((m) => String(m._id) === String(msg._id))) return prev;
+        return {
+          ...prev,
+          [msg.roomId]: [...list, msg],
+        };
+      });
+      refreshAdminConversations();
+    });
+
+    // Live typing indicator
+    socket.on("user_typing", ({ senderId }) => {
+      setTypingUsers((prev) => ({ ...prev, [String(senderId)]: true }));
+    });
+
+    socket.on("user_stop_typing", ({ senderId }) => {
+      setTypingUsers((prev) => {
+        const next = { ...prev };
+        delete next[String(senderId)];
+        return next;
+      });
+    });
+
+    // Blue ticks read receipt
+    socket.on("messages_seen", ({ byUserId }) => {
+      const partnerStr = String(byUserId);
+      setMessagesByPartner((prev) => {
+        const list = prev[partnerStr];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [partnerStr]: list.map((m) =>
+            String(m.senderId) === currentUserId ? { ...m, status: "seen" } : m
+          ),
+        };
+      });
+    });
+
+    // Task status live update
+    socket.on("task_status_updated", (updatedMsg) => {
+      const partnerId =
+        String(updatedMsg.senderId) === currentUserId
+          ? String(updatedMsg.receiverId)
+          : String(updatedMsg.senderId);
+
+      setMessagesByPartner((prev) => {
+        const list = prev[partnerId];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [partnerId]: list.map((m) =>
+            String(m._id) === String(updatedMsg._id) ? updatedMsg : m
+          ),
+        };
+      });
+    });
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [
+    session,
+    currentUserId,
+    refreshContacts,
+    refreshAdminConversations,
+    requestNotificationPermission,
+  ]);
+
+  // Optimistic instant send
+  const sendMessage = useCallback(
+    ({
+      receiver,
+      text = "",
+      messageType = "text",
+      task = null,
+      attachmentUrl = "",
+      attachmentName = "",
+    }) => {
+      if (!receiver?._id) return;
+      const receiverIdStr = String(receiver._id);
+      const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+      const optimisticMsg = {
+        _id: tempId,
+        tempId,
+        roomId: buildRoomId(currentUserId, receiverIdStr),
+        senderId: currentUserId,
+        senderRole: currentUserRole,
+        senderName: currentUser?.name || "Me",
+        receiverId: receiverIdStr,
+        receiverRole: receiver.role || "student",
+        receiverName: receiver.name || "User",
+        messageType,
+        text: String(text || "").trim(),
+        task,
+        attachmentUrl,
+        attachmentName,
+        status: "sent",
+        createdAt: new Date().toISOString(),
+      };
+
+      setMessagesByPartner((prev) => ({
+        ...prev,
+        [receiverIdStr]: [...(prev[receiverIdStr] || []), optimisticMsg],
+      }));
+
+      const previewText =
+        messageType === "task"
+          ? `📋 Task: ${task?.title || text}`
+          : text || attachmentName;
+
+      setContacts((prev) =>
+        prev.map((c) =>
+          String(c._id) === receiverIdStr
+            ? {
+                ...c,
+                lastMessage: previewText,
+                lastMessageTime: optimisticMsg.createdAt,
+              }
+            : c
+        )
+      );
+
+      if (socketRef.current?.connected) {
+        socketRef.current.emit(
+          "send_message",
+          {
+            receiverId: receiverIdStr,
+            receiverRole: receiver.role || "student",
+            receiverName: receiver.name || "User",
+            text,
+            messageType,
+            task,
+            attachmentUrl,
+            attachmentName,
+            tempId,
+          },
+          (ack) => {
+            if (ack?.success && ack.message) {
+              setMessagesByPartner((prev) => ({
+                ...prev,
+                [receiverIdStr]: (prev[receiverIdStr] || []).map((m) =>
+                  m._id === tempId ? ack.message : m
+                ),
+              }));
+            }
+          }
+        );
+      }
+    },
+    [currentUser, currentUserId, currentUserRole]
+  );
+
+  // Delete single message ("me" | "everyone")
+  const deleteMessage = useCallback(async (partnerId, messageId, mode = "me") => {
+    const partnerStr = String(partnerId);
+    const msgIdStr = String(messageId);
+
+    if (mode === "me") {
+      setMessagesByPartner((prev) => ({
+        ...prev,
+        [partnerStr]: (prev[partnerStr] || []).filter(
+          (m) => String(m._id) !== msgIdStr
+        ),
+      }));
+    } else {
+      setMessagesByPartner((prev) => ({
+        ...prev,
+        [partnerStr]: (prev[partnerStr] || []).map((m) =>
+          String(m._id) === msgIdStr
+            ? {
+                ...m,
+                isDeletedForEveryone: true,
+                messageType: "text",
+                text: "🚫 This message was deleted",
+                attachmentUrl: "",
+                attachmentName: "",
+                task: undefined,
+              }
+            : m
+        ),
+      }));
+    }
+
+    if (!msgIdStr.startsWith("temp_")) {
+      await apiCall(`/chat/message/${msgIdStr}?mode=${mode}`, "DELETE");
+    }
+  }, []);
+
+  // Delete / Clear entire chat with a partner
+  const clearChatWithPartner = useCallback(async (partnerId) => {
+    const partnerStr = String(partnerId);
+    setMessagesByPartner((prev) => ({
+      ...prev,
+      [partnerStr]: [],
+    }));
+    setContacts((prev) =>
+      prev.map((c) =>
+        String(c._id) === partnerStr
+          ? { ...c, lastMessage: "", lastMessageTime: null, unreadCount: 0 }
+          : c
+      )
+    );
+    await apiCall(`/chat/conversation/${partnerStr}`, "DELETE");
+  }, []);
+
+  // Admin: Permanently delete a monitored conversation room
+  const deleteAdminMonitorRoom = useCallback(async (roomId) => {
+    await apiCall(`/chat/admin/room/${roomId}`, "DELETE");
+    setAdminConversations((prev) => prev.filter((c) => c._id !== roomId));
+    setAdminRoomMessages((prev) => {
+      const next = { ...prev };
+      delete next[roomId];
+      return next;
+    });
+  }, []);
+
+  const emitTyping = useCallback((receiverId) => {
+    if (socketRef.current?.connected && receiverId) {
+      socketRef.current.emit("typing", { receiverId: String(receiverId) });
+    }
+  }, []);
+
+  const emitStopTyping = useCallback((receiverId) => {
+    if (socketRef.current?.connected && receiverId) {
+      socketRef.current.emit("stop_typing", { receiverId: String(receiverId) });
+    }
+  }, []);
+
+  const updateTaskStatus = useCallback(async (messageId, status) => {
+    const res = await apiCall(`/chat/task/${messageId}/status`, "PATCH", {
+      status,
+    });
+    return res;
+  }, []);
+
+  const totalUnreadCount = useMemo(() => {
+    return contacts.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+  }, [contacts]);
+
+  const value = {
+    socketConnected,
+    currentUser,
+    currentUserId,
+    currentUserRole,
+    contacts,
+    refreshContacts,
+    messagesByPartner,
+    activePartnerId,
+    setActivePartnerId,
+    loadMessagesWithPartner,
+    sendMessage,
+    deleteMessage,
+    clearChatWithPartner,
+    onlineUserIds,
+    typingUsers,
+    emitTyping,
+    emitStopTyping,
+    updateTaskStatus,
+    totalUnreadCount,
+    adminConversations,
+    refreshAdminConversations,
+    adminRoomMessages,
+    loadAdminRoomMessages,
+    deleteAdminMonitorRoom,
+  };
+
+  return (
+    <ChatContext.Provider value={value}>
+      {children}
+
+      {/* Floating Instant Message Notification Banner */}
+      {toastAlert && (
+        <div className="fixed top-4 right-4 z-[9999] max-w-xs w-full bg-[#075E54] text-white rounded-2xl shadow-2xl p-3.5 border border-emerald-400/30">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[11px] font-black uppercase tracking-wider text-emerald-200">
+                💬 {toastAlert.senderName} ({toastAlert.senderRole})
+              </p>
+              <p className="text-xs text-white truncate mt-0.5">
+                {toastAlert.text}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setToastAlert(null)}
+              className="text-emerald-200 hover:text-white text-xs font-bold"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+    </ChatContext.Provider>
+  );
+}
+
+export const useChat = () => useContext(ChatContext);
